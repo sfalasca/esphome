@@ -506,6 +506,13 @@ async def to_code(config: ConfigType) -> None:
 
     cg.add_define("USE_API")
     cg.add_global(api_ns.using)
+    # Compile-time-only test dependency (consteval asserts in api_overflow_buffer.cpp);
+    # header-only, contributes zero bytes to the firmware.
+    cg.add_library(
+        "compile-time-unit-testing",
+        None,
+        "https://github.com/sfalasca/compile-time-unit-testing#v1.0.1",
+    )
 
 
 KEY_VALUE_SCHEMA = cv.Schema({cv.string: cv.templatable(cv.string_strict)})

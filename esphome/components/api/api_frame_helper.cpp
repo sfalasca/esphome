@@ -109,6 +109,11 @@ void APIFrameHelper::log_packet_sending_(const void *data, uint16_t len) {
 #endif
 
 APIError APIFrameHelper::drain_overflow_and_handle_errors_() {
+  // Re-entered from inside a socket write: report OK and let the outer send
+  // finish; draining here would write to the socket mid-write (see in_send_).
+  if (this->in_send_)
+    return APIError::OK;
+  SendScope scope(this->in_send_);
   if (this->overflow_buf_.try_drain(this->socket_.get()) == -1) {
     int err = errno;
     if (err != EWOULDBLOCK && err != EAGAIN) {
@@ -144,13 +149,17 @@ APIError APIFrameHelper::write_raw_iov_(const struct iovec *iov, int iovcnt, uin
         if (err != APIError::OK)
           return err;
       }
-      if (this->overflow_buf_.empty()) {
-        sent = this->write_iov_to_socket_(iov, iovcnt);
+      if (this->overflow_buf_.empty() && !this->in_send_) {
+        {
+          SendScope scope(this->in_send_);
+          sent = this->write_iov_to_socket_(iov, iovcnt);
+        }
         if (sent == static_cast<ssize_t>(total_write_len))
           return APIError::OK;
         // Partial write or -1: fall through to error check / enqueue below
       } else {
-        // Overflow backlog remains after drain; skip socket write, enqueue everything
+        // Overflow backlog remains after drain, or this is a re-entrant send
+        // from inside a socket write; skip socket write, enqueue everything
         sent = 0;
       }
     }

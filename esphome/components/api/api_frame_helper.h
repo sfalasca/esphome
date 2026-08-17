@@ -13,9 +13,75 @@
 #include "esphome/components/socket/socket.h"
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
+#include <compile_time_ut.hpp>
 #include "proto.h"
 
 namespace esphome::api {
+
+// The decision write_raw_fast_buf_ makes about whether a send may call the
+// socket directly right now: yes when the overflow backlog is empty AND no
+// other call on this connection is already inside a socket write (in_send).
+// Extracted as a free function -- not inlined in the `if` -- so the exact
+// decision production code makes can be driven by a compile-time model of a
+// re-entrant call arriving while this decision's resulting socket write
+// hasn't returned yet (see the compile-time test right below).
+constexpr bool may_write_now(bool overflow_empty, bool in_send) { return overflow_empty && !in_send; }
+
+namespace detail {
+
+// Compile-time model of a re-entrant call arriving while an outer call's
+// socket write is in flight -- e.g. a log line emitted from inside
+// socket_->write() on the same connection, exactly the #18434 trigger.
+// Drives may_write_now() -- the real decision write_raw_fast_buf_ makes --
+// through that scenario and counts the deepest nesting of overlapping calls
+// it allows into the (simulated) socket writer.
+struct ReentrancySimulation {
+  bool overflow_empty = true;
+  bool in_send = false;  // mirrors in_send_, set for the SendScope's duration
+  int writer_depth = 0;
+  int max_writer_depth = 0;
+
+  // Mirrors write_raw_fast_buf_: consult the real decision function, and if
+  // it says yes, "call the socket" (tracking writer_depth, and toggling
+  // in_send exactly as SendScope does, around it) -- during which `trigger`
+  // may recursively call send() again, simulating the log-message reentry.
+  // Deferring to the overflow backlog (the `false` branch) never touches
+  // the writer, so it isn't modeled further here.
+  template<typename Trigger> constexpr void send(Trigger &&trigger) {
+    if (may_write_now(this->overflow_empty, this->in_send)) {
+      this->writer_depth++;
+      if (this->writer_depth > this->max_writer_depth)
+        this->max_writer_depth = this->writer_depth;
+      this->in_send = true;
+      trigger();
+      this->in_send = false;
+      this->writer_depth--;
+    }
+  }
+};
+
+constexpr int simulate_log_during_send() {
+  ReentrancySimulation sim;
+  sim.send([&] {
+    // A log line fires from inside the socket write and re-enters the send
+    // path on the same connection before the outer write returns.
+    sim.send([] { /* nested write completes; no further reentry modeled */ });
+  });
+  return sim.max_writer_depth;
+}
+
+constexpr bool test_send_path_rejects_overlapping_socket_writes() {
+  using namespace CompileTimeUnitTesting;
+  // At most one call into the socket writer may be in flight at a time on a
+  // single connection -- a second, overlapping call mutates state (lwIP's
+  // pcb segment list) the first call is still iterating over (#18434).
+  // The in_send guard above makes may_write_now() reject the nested call.
+  expect_eq<simulate_log_during_send(), 1>();
+  return true;
+}
+static_assert(test_send_path_rejects_overlapping_socket_writes());
+
+}  // namespace detail
 
 // uncomment to log raw packets
 //#define HELPER_LOG_PACKETS
@@ -117,7 +183,9 @@ class APIFrameHelper {
   virtual APIError init() = 0;
   virtual APIError loop() = 0;
   virtual APIError read_packet(ReadPacketBuffer *buffer) = 0;
-  bool can_write_without_blocking() { return this->state_ == State::DATA && this->overflow_buf_.empty(); }
+  bool can_write_without_blocking() {
+    return this->state_ == State::DATA && this->overflow_buf_.empty() && !this->in_send_;
+  }
   int getpeername(struct sockaddr *addr, socklen_t *addrlen) { return socket_->getpeername(addr, addrlen); }
   APIError close() {
     if (state_ == State::CLOSED)
@@ -232,6 +300,13 @@ class APIFrameHelper {
   static constexpr ssize_t WRITE_FAILED = -1;         // Fast path: write()/writev() returned -1
   static constexpr ssize_t WRITE_NOT_ATTEMPTED = -2;  // Cold path: no write attempted yet
 
+  // RAII scope marking "a socket send is in progress" — see in_send_.
+  struct SendScope {
+    explicit SendScope(bool &flag) : flag_(flag) { flag_ = true; }
+    ~SendScope() { this->flag_ = false; }
+    bool &flag_;
+  };
+
   // Dispatch to write() or writev() based on iovec count
   inline ssize_t ESPHOME_ALWAYS_INLINE write_iov_to_socket_(const struct iovec *iov, int iovcnt) {
     return (iovcnt == 1) ? this->socket_->write(iov[0].iov_base, iov[0].iov_len) : this->socket_->writev(iov, iovcnt);
@@ -241,8 +316,12 @@ class APIFrameHelper {
   // These inline the fast path (overflow empty + full write) and tail-call the out-of-line
   // slow path only on failure/partial write.
   inline APIError ESPHOME_ALWAYS_INLINE write_raw_fast_buf_(const void *data, uint16_t len) {
-    if (this->overflow_buf_.empty()) [[likely]] {
-      ssize_t sent = this->socket_->write(data, len);
+    if (may_write_now(this->overflow_buf_.empty(), this->in_send_)) [[likely]] {
+      ssize_t sent;
+      {
+        SendScope scope(this->in_send_);
+        sent = this->socket_->write(data, len);
+      }
       if (sent == static_cast<ssize_t>(len)) [[likely]] {
 #ifdef HELPER_LOG_PACKETS
         this->log_packet_sending_(data, len);
@@ -306,6 +385,13 @@ class APIFrameHelper {
   // Group smaller types together
   uint16_t rx_buf_len_ = 0;
   State state_{State::INITIALIZE};
+  // True while this helper is inside socket_->write()/writev(). socket->write()
+  // can re-enter the API send path (e.g. a log message emitted from an lwip
+  // callback during the write): a nested write on the same TCP pcb mutates the
+  // segment list the outer tcp_output() is iterating and crashes lwip (#18434).
+  // While set, every send is redirected to the overflow backlog instead of
+  // touching the socket; the backlog drains on the next loop().
+  bool in_send_{false};
   uint8_t frame_header_padding_{0};
   uint8_t frame_footer_size_{0};
   // Nagle batching counter for log messages. 0 means NODELAY is enabled (immediate send).

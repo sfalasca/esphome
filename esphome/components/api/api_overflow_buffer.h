@@ -61,6 +61,9 @@ class APIOverflowBuffer {
 
   /// Enqueue unsent IOV data into the backlog.
   /// Copies iov data starting at byte offset `skip` into a new entry.
+  /// A partial remainder (`skip > 0`) is queued at the FRONT of the ring: its first
+  /// bytes are already on the wire, so it must precede any frame a re-entrant send
+  /// enqueued while the partial write was in progress (see APIFrameHelper::in_send_).
   /// Returns false if the queue is full (caller should fail the connection).
   bool enqueue_iov(const struct iovec *iov, int iovcnt, uint16_t total_len, uint16_t skip);
 
